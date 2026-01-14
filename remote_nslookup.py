@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 import urllib.request
+from urllib.parse import urlencode
 
 
 def process_records(records, key, display_type):
@@ -69,19 +70,18 @@ def main():
 
     args = parser.parse_args()
 
-    url = "https://www.nslookup.io/api/v1/records"
-    payload = {"domain": args.domain, "dnsServer": args.dns_server}
+    params = {"domain": args.domain, "server": args.dns_server}
+    url = "https://www.nslookup.io/api/v1/records?" + urlencode(params)
 
     try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            },
-        )
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "cache-control": "no-cache",
+            "pragma": "no-cache",
+            "referer": f"https://www.nslookup.io/domains/{args.domain}/dns-records/",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        }
+        req = urllib.request.Request(url, headers=headers)
 
         with urllib.request.urlopen(req) as response:
             if response.status != 200:
