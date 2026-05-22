@@ -305,7 +305,8 @@ def download_file_once(
                     pass
 
     workers = []
-    for _ in range(max(1, threads)):
+    num_workers = min(max(1, threads), len(tasks))
+    for _ in range(num_workers):
         t = threading.Thread(target=worker)
         t.start()
         workers.append(t)
@@ -466,10 +467,12 @@ def run_client(
         if policy == "c":
             return
 
-    for f in files:
+    import concurrent.futures
+
+    def download_wrapper(f: Dict) -> None:
         local_path = f["path"].replace("/", os.sep)
         if os.path.exists(local_path) and policy == "s":
-            continue
+            return
         download_file_with_retry(
             host,
             port,
@@ -481,6 +484,11 @@ def run_client(
             max_chunk_retries,
         )
         print(f"Downloaded {f['path']}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, threads)) as executor:
+        futures = [executor.submit(download_wrapper, f) for f in files]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
 
 
 def prompt_mode() -> str:
