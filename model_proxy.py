@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
@@ -50,6 +51,29 @@ model_cache:
 auth:
   api_key: sk-xxxx
 """
+
+
+class LogFormatter(logging.Formatter):
+    """Pad the level like uvicorn does so both kinds of line start at the same column."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.levelprefix = f"{record.levelname}:".ljust(10)
+        return super().format(record)
+
+
+logger = logging.getLogger("model_proxy")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(LogFormatter("%(levelprefix)s%(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(os.getenv("MODEL_MAPPER_LOG_LEVEL", "INFO").upper())
+    # Do not print twice once uvicorn takes over the root logger.
+    logger.propagate = False
+
+
+def body_snippet(content: bytes, limit: int = 300) -> str:
+    text = content[:limit].decode("utf-8", "replace").replace("\n", " ")
+    return text + ("..." if len(content) > limit else "")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -139,8 +163,14 @@ async def refresh_upstream_models() -> None:
                     for item in data
                     if isinstance(item, dict) and isinstance(item.get("id"), str)
                 ]
-            except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                logger.info(
+                    "cached /v1/models %s: %s",
+                    upstream_name,
+                    ", ".join(item["id"] for item in upstream_models[upstream_name]) or "(empty)",
+                )
+            except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
                 # Keep the previous cache when an upstream is temporarily unavailable.
+                logger.warning("upstream %s /v1/models refresh failed: %s", upstream_name, exc)
                 continue
 
 
@@ -187,17 +217,18 @@ def model_owner(model_id: str) -> str | None:
     return None
 
 
-def resolve_model(requested: str) -> tuple[dict[str, Any], str]:
+def resolve_model(requested: str) -> tuple[str, str, str]:
+    """Resolve a requested model into (upstream name, model to send, how it was routed)."""
     mapping = (config.get("models") or {}).get(requested)
     if mapping:
-        return config["upstreams"][mapping["upstream"]], mapping["model"]
+        return mapping["upstream"], mapping["model"], "mapping"
     # /v1/models advertises every upstream's own models, so an id served by a single
     # upstream must be routed there instead of straight to default_upstream. Only ids we
     # have never seen (cache still empty, disabled, or an upstream that is down) fall back.
     owner = model_owner(requested)
     if owner:
-        return config["upstreams"][owner], requested
-    return config["upstreams"][config["default_upstream"]], requested
+        return owner, requested, "owner"
+    return config["default_upstream"], requested, "default"
 
 
 @app.get("/health")
@@ -218,8 +249,12 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
     requested = body.get("model")
     if not isinstance(requested, str) or not requested:
         raise HTTPException(400, "Request must include a model")
-    upstream, target = resolve_model(requested)
+    upstream_name, target, route = resolve_model(requested)
+    upstream = config["upstreams"][upstream_name]
     payload = dict(body, model=target)
+    streaming = bool(payload.get("stream"))
+    label = f"{request.method} {request.url.path} model={requested} -> {upstream_name}/{target}"
+    logger.info("%s stream=%s route=%s", label, streaming, route)
     client = httpx.AsyncClient(timeout=upstream.get("timeout", 120.0))
     try:
         response = await client.send(
@@ -237,6 +272,7 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
         )
     except httpx.HTTPError as exc:
         await client.aclose()
+        logger.error("%s upstream request failed: %s", label, exc)
         raise HTTPException(502, f"Upstream request failed: {exc}") from exc
 
     headers = {}
@@ -250,7 +286,13 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
         content = b"".join([chunk async for chunk in response.aiter_raw()])
         await response.aclose()
         await client.aclose()
+        if status >= 400:
+            logger.warning("%s status=%s body=%s", label, status, body_snippet(content))
         return Response(content=content, status_code=status, media_type=media_type, headers=headers)
+
+    if status >= 400:
+        # The upstream error body is streamed through untouched, so only the status is known.
+        logger.warning("%s status=%s (upstream error, body not logged for streams)", label, status)
 
     async def body_stream() -> AsyncIterator[bytes]:
         try:
