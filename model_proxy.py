@@ -3,8 +3,25 @@
 # requires-python = ">=3.11"
 # dependencies = ["fastapi>=0.115,<1", "httpx>=0.27,<1", "PyYAML>=6,<7", "uvicorn>=0.30,<1"]
 # ///
-"""Small OpenAI-compatible gateway. Run: uv run uvicorn model_proxy:app --host 127.0.0.1 --port 8000."""
+"""Small OpenAI-compatible gateway. Run: uv run uvicorn model_proxy:app --host 127.0.0.1 --port 15731."""
 
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import secrets
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+import httpx
+import yaml
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
+
+
+CONFIG_PATH = Path(os.getenv("MODEL_MAPPER_CONFIG", "model_proxy_config.yaml"))
 # config.yaml
 """
 default_upstream: openai
@@ -33,24 +50,6 @@ model_cache:
 auth:
   api_key: sk-xxxx
 """
-
-from __future__ import annotations
-
-import asyncio
-import json
-import os
-import secrets
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any, AsyncIterator
-
-import httpx
-import yaml
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
-
-
-CONFIG_PATH = Path(os.getenv("MODEL_MAPPER_CONFIG", "config.yaml"))
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -178,10 +177,26 @@ async def require_auth(request: Request) -> None:
         raise HTTPException(401, "Invalid or missing API key", {"WWW-Authenticate": "Bearer"})
 
 
+def model_owner(model_id: str) -> str | None:
+    """Upstream whose /v1/models listing contains this id, preferring default_upstream."""
+    default = config["default_upstream"]
+    order = [default, *(name for name in config["upstreams"] if name != default)]
+    for name in order:
+        if any(item["id"] == model_id for item in upstream_models.get(name, [])):
+            return name
+    return None
+
+
 def resolve_model(requested: str) -> tuple[dict[str, Any], str]:
     mapping = (config.get("models") or {}).get(requested)
     if mapping:
         return config["upstreams"][mapping["upstream"]], mapping["model"]
+    # /v1/models advertises every upstream's own models, so an id served by a single
+    # upstream must be routed there instead of straight to default_upstream. Only ids we
+    # have never seen (cache still empty, disabled, or an upstream that is down) fall back.
+    owner = model_owner(requested)
+    if owner:
+        return config["upstreams"][owner], requested
     return config["upstreams"][config["default_upstream"]], requested
 
 
@@ -211,7 +226,11 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
             client.build_request(
                 "POST",
                 f"{upstream['base_url'].rstrip('/')}/{endpoint}",
-                headers={"Authorization": f"Bearer {upstream['api_key']}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {upstream['api_key']}",
+                    "Content-Type": "application/json",
+                    "Accept-Encoding": request.headers.get("accept-encoding", "identity"),
+                },
                 json=payload,
             ),
             stream=True,
@@ -219,13 +238,19 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
     except httpx.HTTPError as exc:
         await client.aclose()
         raise HTTPException(502, f"Upstream request failed: {exc}") from exc
+
+    headers = {}
+    encoding = response.headers.get("content-encoding")
+    if encoding:
+        headers["Content-Encoding"] = encoding
+    media_type = response.headers.get("content-type", "application/json")
+    status = response.status_code
+
     if not payload.get("stream"):
-        content = await response.aread()
-        media_type = response.headers.get("content-type", "application/json").split(";", 1)[0]
-        status = response.status_code
+        content = b"".join([chunk async for chunk in response.aiter_raw()])
         await response.aclose()
         await client.aclose()
-        return Response(content=content, status_code=status, media_type=media_type)
+        return Response(content=content, status_code=status, media_type=media_type, headers=headers)
 
     async def body_stream() -> AsyncIterator[bytes]:
         try:
@@ -235,7 +260,7 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
             await response.aclose()
             await client.aclose()
 
-    return StreamingResponse(body_stream(), status_code=response.status_code, media_type="text/event-stream")
+    return StreamingResponse(body_stream(), status_code=status, media_type=media_type, headers=headers)
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_auth)])
@@ -246,3 +271,13 @@ async def chat_completions(request: Request):
 @app.post("/v1/responses", dependencies=[Depends(require_auth)])
 async def responses(request: Request):
     return await proxy_openai_endpoint(request, "responses")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=os.getenv("MODEL_MAPPER_HOST", "127.0.0.1"),
+        port=int(os.getenv("MODEL_MAPPER_PORT", "15731")),
+    )
