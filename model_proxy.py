@@ -123,7 +123,12 @@ def load_config(path: Path) -> dict[str, Any]:
 
 config = load_config(CONFIG_PATH)
 upstream_models: dict[str, list[dict[str, Any]]] = {}
+model_cache_ready = asyncio.Event()
 model_cache_task: asyncio.Task[None] | None = None
+
+
+def cache_enabled() -> bool:
+    return (config.get("model_cache") or {}).get("enabled", True) is not False
 
 
 def model_object(model_id: str, owned_by: str) -> dict[str, str]:
@@ -176,19 +181,20 @@ async def refresh_upstream_models() -> None:
 
 async def model_cache_loop() -> None:
     cache = config.get("model_cache") or {}
-    if cache.get("enabled", True) is False:
-        return
     interval = float(cache.get("ttl_seconds", 1800))
     while True:
         await refresh_upstream_models()
+        model_cache_ready.set()
         await asyncio.sleep(interval)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global model_cache_task
-    if (config.get("model_cache") or {}).get("enabled", True):
+    if cache_enabled():
         model_cache_task = asyncio.create_task(model_cache_loop())
+    else:
+        model_cache_ready.set()
     yield
     if model_cache_task:
         model_cache_task.cancel()
@@ -249,6 +255,11 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
     requested = body.get("model")
     if not isinstance(requested, str) or not requested:
         raise HTTPException(400, "Request must include a model")
+    # Do not race the initial /v1/models refresh: before the cache is populated,
+    # owner-routed models would otherwise silently fall back to default_upstream.
+    explicit_mapping = (config.get("models") or {}).get(requested)
+    if cache_enabled() and explicit_mapping is None:
+        await model_cache_ready.wait()
     upstream_name, target, route = resolve_model(requested)
     upstream = config["upstreams"][upstream_name]
     payload = dict(body, model=target)
@@ -295,9 +306,14 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
         logger.warning("%s status=%s (upstream error, body not logged for streams)", label, status)
 
     async def body_stream() -> AsyncIterator[bytes]:
+        sent = 0
         try:
             async for chunk in response.aiter_raw():
+                sent += len(chunk)
                 yield chunk
+        except httpx.HTTPError as exc:
+            logger.error("%s upstream stream failed after bytes=%d: %s", label, sent, exc)
+            raise
         finally:
             await response.aclose()
             await client.aclose()
