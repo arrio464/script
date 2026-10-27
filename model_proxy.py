@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import os
 import secrets
+import zlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -71,9 +73,39 @@ if not logger.handlers:
     logger.propagate = False
 
 
-def body_snippet(content: bytes, limit: int = 300) -> str:
-    text = content[:limit].decode("utf-8", "replace").replace("\n", " ")
-    return text + ("..." if len(content) > limit else "")
+def decompress_body(content: bytes, encoding: str | None) -> bytes:
+    """Best-effort undo of Content-Encoding, for logging only.
+
+    Bodies are streamed through untouched, so what we hold is still compressed;
+    logging those bytes raw makes journald store "[NNB blob data]" instead of text
+    and hides upstream errors. Returns `content` itself when it cannot decode.
+    """
+    if not encoding:
+        return content
+    try:
+        if encoding.lower() in ("gzip", "x-gzip"):
+            return gzip.decompress(content)
+        if encoding.lower() == "deflate":
+            try:
+                return zlib.decompress(content)
+            except zlib.error:
+                # Servers disagree on whether deflate means zlib or a raw stream.
+                return zlib.decompress(content, -zlib.MAX_WBITS)
+    except (OSError, EOFError, zlib.error):
+        return content
+    return content
+
+
+def body_snippet(content: bytes, limit: int = 300, encoding: str | None = None) -> str:
+    raw = decompress_body(content, encoding)
+    text = raw[:limit].decode("utf-8", "replace")
+    # Control bytes (NUL, newlines) are what make journalctl print a blob marker.
+    text = " ".join("".join(char if char.isprintable() else " " for char in text).split())
+    if len(raw) > limit:
+        text += "..."
+    if raw is content and encoding:
+        text = f"[{encoding} encoded] {text}"
+    return text
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -106,6 +138,14 @@ def load_config(path: Path) -> dict[str, Any]:
     if not isinstance(timeout, (int, float)) or timeout <= 0:
         raise RuntimeError("model_cache.request_timeout_seconds must be positive")
 
+    watch = config.get("config_watch") or {}
+    if not isinstance(watch, dict):
+        raise RuntimeError("config_watch must be a mapping")
+    for key, default in (("interval_seconds", 1), ("settle_seconds", 0.5)):
+        value = watch.get(key, default)
+        if not isinstance(value, (int, float)) or value <= 0:
+            raise RuntimeError(f"config_watch.{key} must be positive")
+
     for name, upstream in upstreams.items():
         if not isinstance(upstream, dict) or not upstream.get("base_url"):
             raise RuntimeError(f"Upstream {name!r} must define base_url")
@@ -125,10 +165,12 @@ config = load_config(CONFIG_PATH)
 upstream_models: dict[str, list[dict[str, Any]]] = {}
 model_cache_ready = asyncio.Event()
 model_cache_task: asyncio.Task[None] | None = None
+config_watch_task: asyncio.Task[None] | None = None
 
 
-def cache_enabled() -> bool:
-    return (config.get("model_cache") or {}).get("enabled", True) is not False
+def cache_enabled(cfg: dict[str, Any] | None = None) -> bool:
+    active = config if cfg is None else cfg
+    return (active.get("model_cache") or {}).get("enabled", True) is not False
 
 
 def model_object(model_id: str, owned_by: str) -> dict[str, str]:
@@ -180,25 +222,76 @@ async def refresh_upstream_models() -> None:
 
 
 async def model_cache_loop() -> None:
-    cache = config.get("model_cache") or {}
-    interval = float(cache.get("ttl_seconds", 1800))
     while True:
         await refresh_upstream_models()
         model_cache_ready.set()
+        # Re-read each round so a reload can retune the refresh interval.
+        interval = float((config.get("model_cache") or {}).get("ttl_seconds", 1800))
         await asyncio.sleep(interval)
+
+
+async def sync_model_cache_task() -> None:
+    """Start or stop the /v1/models refresher so it matches the current config."""
+    global model_cache_task
+    if cache_enabled():
+        if model_cache_task is None or model_cache_task.done():
+            model_cache_task = asyncio.create_task(model_cache_loop())
+        return
+    if model_cache_task is not None and not model_cache_task.done():
+        model_cache_task.cancel()
+        await asyncio.gather(model_cache_task, return_exceptions=True)
+    model_cache_task = None
+    model_cache_ready.set()
+
+
+def config_stamp() -> tuple[int, int] | None:
+    try:
+        stat = CONFIG_PATH.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+async def config_watch_loop() -> None:
+    """Reload the YAML in place, so upstreams/models/auth edits need no restart."""
+    global config
+    stamp = config_stamp()
+    while True:
+        watch = config.get("config_watch") or {}
+        interval = float(watch.get("interval_seconds", 1))
+        settle = float(watch.get("settle_seconds", 0.5))
+        await asyncio.sleep(interval)
+        current = config_stamp()
+        if current is None or current == stamp:
+            continue
+        stamp = current
+        # Editors truncate and rewrite in place, so wait for the file to settle.
+        await asyncio.sleep(settle)
+        settled = config_stamp()
+        if settled != current:
+            stamp = settled
+            continue
+        try:
+            reloaded = load_config(CONFIG_PATH)
+        except (OSError, RuntimeError, yaml.YAMLError) as exc:
+            logger.error("config reload rejected, keeping the running config: %s", exc)
+            continue
+        config = reloaded
+        logger.info("config reloaded from %s", CONFIG_PATH)
+        await sync_model_cache_task()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global model_cache_task
-    if cache_enabled():
-        model_cache_task = asyncio.create_task(model_cache_loop())
-    else:
-        model_cache_ready.set()
+    global config_watch_task
+    await sync_model_cache_task()
+    if (config.get("config_watch") or {}).get("enabled", True) is not False:
+        config_watch_task = asyncio.create_task(config_watch_loop())
     yield
-    if model_cache_task:
-        model_cache_task.cancel()
-        await asyncio.gather(model_cache_task, return_exceptions=True)
+    for task in (config_watch_task, model_cache_task):
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 app = FastAPI(title="Model Mapper", lifespan=lifespan)
@@ -216,28 +309,28 @@ async def require_auth(request: Request) -> None:
         raise HTTPException(401, "Invalid or missing API key", {"WWW-Authenticate": "Bearer"})
 
 
-def model_owner(model_id: str) -> str | None:
+def model_owner(model_id: str, cfg: dict[str, Any]) -> str | None:
     """Upstream whose /v1/models listing contains this id, preferring default_upstream."""
-    default = config["default_upstream"]
-    order = [default, *(name for name in config["upstreams"] if name != default)]
+    default = cfg["default_upstream"]
+    order = [default, *(name for name in cfg["upstreams"] if name != default)]
     for name in order:
         if any(item["id"] == model_id for item in upstream_models.get(name, [])):
             return name
     return None
 
 
-def resolve_model(requested: str) -> tuple[str, str, str]:
+def resolve_model(requested: str, cfg: dict[str, Any]) -> tuple[str, str, str]:
     """Resolve a requested model into (upstream name, model to send, how it was routed)."""
-    mapping = (config.get("models") or {}).get(requested)
+    mapping = (cfg.get("models") or {}).get(requested)
     if mapping:
         return mapping["upstream"], mapping["model"], "mapping"
     # /v1/models advertises every upstream's own models, so an id served by a single
     # upstream must be routed there instead of straight to default_upstream. Only ids we
     # have never seen (cache still empty, disabled, or an upstream that is down) fall back.
-    owner = model_owner(requested)
+    owner = model_owner(requested, cfg)
     if owner:
         return owner, requested, "owner"
-    return config["default_upstream"], requested, "default"
+    return cfg["default_upstream"], requested, "default"
 
 
 @app.get("/health")
@@ -283,13 +376,23 @@ async def proxy_endpoint(request: Request, endpoint: str, style: str = "openai")
     requested = body.get("model")
     if not isinstance(requested, str) or not requested:
         raise HTTPException(400, "Request must include a model")
+    # Snapshot: a hot reload can swap the module global while this request awaits.
+    cfg = config
     # Do not race the initial /v1/models refresh: before the cache is populated,
     # owner-routed models would otherwise silently fall back to default_upstream.
-    explicit_mapping = (config.get("models") or {}).get(requested)
-    if cache_enabled() and explicit_mapping is None:
+    explicit_mapping = (cfg.get("models") or {}).get(requested)
+    if cache_enabled(cfg) and explicit_mapping is None:
         await model_cache_ready.wait()
-    upstream_name, target, route = resolve_model(requested)
-    upstream = config["upstreams"][upstream_name]
+    upstream_name, target, route = resolve_model(requested, cfg)
+    if route == "default":
+        # A model the default upstream does not serve comes back as an opaque 4xx from
+        # upstream; say so instead of leaving the fallback silent.
+        logger.warning(
+            "model %s is not mapped and no upstream advertises it; falling back to %s",
+            requested,
+            upstream_name,
+        )
+    upstream = cfg["upstreams"][upstream_name]
     payload = dict(body, model=target)
     streaming = bool(payload.get("stream"))
     label = f"{request.method} {request.url.path} model={requested} -> {upstream_name}/{target}"
@@ -322,7 +425,7 @@ async def proxy_endpoint(request: Request, endpoint: str, style: str = "openai")
         await response.aclose()
         await client.aclose()
         if status >= 400:
-            logger.warning("%s status=%s body=%s", label, status, body_snippet(content))
+            logger.warning("%s status=%s body=%s", label, status, body_snippet(content, encoding=encoding))
         return Response(content=content, status_code=status, media_type=media_type, headers=headers)
 
     if status >= 400:
