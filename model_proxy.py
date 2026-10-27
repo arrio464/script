@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["fastapi>=0.115,<1", "httpx>=0.27,<1", "PyYAML>=6,<7", "uvicorn>=0.30,<1"]
 # ///
-"""Small OpenAI-compatible gateway. Run: uv run uvicorn model_proxy:app --host 127.0.0.1 --port 15731."""
+"""Small OpenAI/Anthropic-compatible gateway. Run: uv run uvicorn model_proxy:app --host 127.0.0.1 --port 15731."""
 
 from __future__ import annotations
 
@@ -209,7 +209,10 @@ async def require_auth(request: Request) -> None:
     if not expected:
         return
     scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not supplied or not secrets.compare_digest(supplied, expected):
+    if scheme.lower() != "bearer" or not supplied:
+        # Anthropic clients (Claude Code, the Anthropic SDKs) authenticate with x-api-key.
+        supplied = request.headers.get("x-api-key", "")
+    if not supplied or not secrets.compare_digest(supplied.encode(), expected.encode()):
         raise HTTPException(401, "Invalid or missing API key", {"WWW-Authenticate": "Bearer"})
 
 
@@ -247,7 +250,32 @@ async def models() -> dict[str, Any]:
     return {"object": "list", "data": unique_models()}
 
 
-async def proxy_openai_endpoint(request: Request, endpoint: str):
+ANTHROPIC_DEFAULT_VERSION = "2023-06-01"
+
+
+def upstream_request_headers(request: Request, upstream: dict[str, Any], style: str) -> dict[str, str]:
+    """Headers for the upstream call.
+
+    Both styles send Authorization, which every OpenAI-compatible upstream accepts, so
+    an aggregator that speaks both protocols keeps working. The anthropic style adds the
+    Messages API headers the client sent: x-api-key is the documented credential and
+    anthropic-version pins the protocol revision between client and upstream.
+    """
+    headers = {
+        "Authorization": f"Bearer {upstream['api_key']}",
+        "Content-Type": "application/json",
+        "Accept-Encoding": request.headers.get("accept-encoding", "identity"),
+    }
+    if style == "anthropic":
+        headers["x-api-key"] = upstream["api_key"]
+        headers["anthropic-version"] = request.headers.get("anthropic-version", ANTHROPIC_DEFAULT_VERSION)
+        beta = request.headers.get("anthropic-beta")
+        if beta:
+            headers["anthropic-beta"] = beta
+    return headers
+
+
+async def proxy_endpoint(request: Request, endpoint: str, style: str = "openai"):
     try:
         body = await request.json()
     except json.JSONDecodeError as exc:
@@ -272,11 +300,7 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
             client.build_request(
                 "POST",
                 f"{upstream['base_url'].rstrip('/')}/{endpoint}",
-                headers={
-                    "Authorization": f"Bearer {upstream['api_key']}",
-                    "Content-Type": "application/json",
-                    "Accept-Encoding": request.headers.get("accept-encoding", "identity"),
-                },
+                headers=upstream_request_headers(request, upstream, style),
                 json=payload,
             ),
             stream=True,
@@ -323,12 +347,23 @@ async def proxy_openai_endpoint(request: Request, endpoint: str):
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_auth)])
 async def chat_completions(request: Request):
-    return await proxy_openai_endpoint(request, "chat/completions")
+    return await proxy_endpoint(request, "chat/completions")
 
 
 @app.post("/v1/responses", dependencies=[Depends(require_auth)])
 async def responses(request: Request):
-    return await proxy_openai_endpoint(request, "responses")
+    return await proxy_endpoint(request, "responses")
+
+
+@app.post("/v1/messages", dependencies=[Depends(require_auth)])
+async def messages(request: Request):
+    """Anthropic Messages API passthrough, for Claude Code and the Anthropic SDKs."""
+    return await proxy_endpoint(request, "messages", style="anthropic")
+
+
+@app.post("/v1/messages/count_tokens", dependencies=[Depends(require_auth)])
+async def messages_count_tokens(request: Request):
+    return await proxy_endpoint(request, "messages/count_tokens", style="anthropic")
 
 
 if __name__ == "__main__":
